@@ -1,1 +1,1 @@
-@dotnet ./publish/ServerShellEx.dll
+dotnet ServerShellEx.dll

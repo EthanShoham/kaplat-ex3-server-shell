@@ -68,7 +68,7 @@ app.MapDelete("/calculator/stack/arguments", ([Microsoft.AspNetCore.Mvc.FromQuer
 
     return Results.Ok(CalculationResultBuilder.FromResult(stack.StackCalculatorSize));
 });
-app.MapPut("/calculator/stack/operate", ([Microsoft.AspNetCore.Mvc.FromQuery(Name = "operation")] string? operationQuery,
+app.MapGet("/calculator/stack/operate", ([Microsoft.AspNetCore.Mvc.FromQuery(Name = "operation")] string? operationQuery,
             ICalculatorStack stack, ICalculator calculator, ICalculationHistory history) =>
 {
     if (operationQuery is null || !Enum.TryParse<Operation>(operationQuery, true, out var operation))

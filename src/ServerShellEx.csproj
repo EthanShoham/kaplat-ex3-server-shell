@@ -7,9 +7,4 @@
     <LangVersion>11</LangVersion>
   </PropertyGroup>
 
-  <ItemGroup>
-    <PackageReference Include="NSwag.AspNetCore" Version="14.3.0" />
-    <PackageReference Include="Swashbuckle.AspNetCore" Version="6.5.0" />
-  </ItemGroup>
-
 </Project>
