@@ -34,17 +34,17 @@ app.MapPost("/calculator/independent/calculate", (CalculationRequest? request, I
 
     if (request.Arguments is null)
     {
-        return Results.Conflict(CalculationResultBuilder.FromErrorMessage($"Error: Not enough arguments to perform the operation {Enum.GetName(operation) ?? throw new InvalidOperationException()}"));
+        return Results.Conflict(CalculationResultBuilder.FromErrorMessage($"Error: Not enough arguments to perform the operation {request.Operation}"));
     }
 
     if (!calculator.TryCalculate(operation, request.Arguments, out var result, out var error))
     {
         Debug.Assert(error is not null);
-        return Results.Conflict(CalculationResultBuilder.FromError(error.Value, Enum.GetName(operation) ?? throw new InvalidOperationException()));
+        return Results.Conflict(CalculationResultBuilder.FromError(error.Value, request.Operation));
     }
 
     Debug.Assert(result is not null);
-    history.Add(Flavor.INDEPENDENT, operation, request.Arguments, result.Value);
+    history.Add(Flavor.Independent, request.Operation, request.Arguments, result.Value);
     return Results.Ok(CalculationResultBuilder.FromResult(result.Value));
 });
 
@@ -80,7 +80,7 @@ app.MapPut("/calculator/stack/operate", ([Microsoft.AspNetCore.Mvc.FromQuery(Nam
     var requiredAmount = calculator.GetRequriedArgumentsCount(operation);
     if (!stack.TryPopStackCalculatorArguments(requiredAmount, out var arguments))
     {
-        return Results.Conflict(CalculationResultBuilder.FromErrorMessage($"Error: cannot implement operation {Enum.GetName(operation) ?? throw new InvalidOperationException()}. It requires {requiredAmount} arguments and the stack has only {stackCount} arguments"));
+        return Results.Conflict(CalculationResultBuilder.FromErrorMessage($"Error: cannot implement operation {operationQuery}. It requires {requiredAmount} arguments and the stack has only {stackCount} arguments"));
     }
 
     Debug.Assert(arguments is not null);
@@ -91,28 +91,26 @@ app.MapPut("/calculator/stack/operate", ([Microsoft.AspNetCore.Mvc.FromQuery(Nam
     }
 
     Debug.Assert(result is not null);
-    history.Add(Flavor.STACK, operation, arguments, result.Value);
+    history.Add(Flavor.Stack, operationQuery, arguments, result.Value);
     return Results.Ok(CalculationResultBuilder.FromResult(result.Value));
 });
 
 app.MapGet("/calculator/history", ([Microsoft.AspNetCore.Mvc.FromQuery(Name = "flavor")] string? flavorString, ICalculationHistory history) =>
 {
-    Flavor? flavor = flavorString switch
+    if (flavorString is null || Flavor.Independent.Equals(flavorString) || Flavor.Stack.Equals(flavorString))
     {
-        "STACK" => Flavor.STACK,
-        "INDEPENDENT" => Flavor.INDEPENDENT,
-        _ => null
-    };
+        return Results.Ok(CalculationResultBuilder.FromResult(history.CalculationsByFlavor(flavorString)));
+    }
 
-    return Results.Ok(CalculationResultBuilder.FromResult(history.CalculationsByFlavor(flavor)));
+    return Results.Conflict(CalculationResultBuilder.FromErrorMessage($"Error: unknown flavor: {flavorString}"));
 });
 
 app.Run();
 
-enum Flavor
+static class Flavor
 {
-    STACK,
-    INDEPENDENT
+    public const string Stack = "STACK";
+    public const string Independent = "INDEPENDENT";
 }
 enum Operation
 {
@@ -164,8 +162,8 @@ interface ICalculatorStack
 }
 interface ICalculationHistory
 {
-    void Add(Flavor flavor, Operation operation, int[] arguments, int result);
-    Calculation[] CalculationsByFlavor(Flavor? flavor);
+    void Add(string flavor, string operation, int[] arguments, int result);
+    Calculation[] CalculationsByFlavor(string? flavor);
 }
 interface ICalculator
 {
@@ -209,27 +207,27 @@ class CalculationHistory : ICalculationHistory
 {
     private readonly ConcurrentQueue<Calculation> stackHistory = new();
     private readonly ConcurrentQueue<Calculation> independentHistory = new();
-    public void Add(Flavor flavor, Operation operation, int[] arguments, int result)
+    public void Add(string flavor, string operation, int[] arguments, int result)
     {
-        var calculation = new Calculation(Enum.GetName<Flavor>(flavor)!, Enum.GetName<Operation>(operation)!, arguments, result);
+        var calculation = new Calculation(flavor, operation, arguments, result);
         switch (flavor)
         {
-            case Flavor.STACK:
+            case Flavor.Stack:
                 stackHistory.Enqueue(calculation);
                 break;
-            case Flavor.INDEPENDENT:
+            case Flavor.Independent:
                 independentHistory.Enqueue(calculation);
                 break;
             default:
                 throw new InvalidOperationException($"Cannot add calculation with flavor: {flavor}, did you forgot to add support for it?");
         }
     }
-    public Calculation[] CalculationsByFlavor(Flavor? flavor)
+    public Calculation[] CalculationsByFlavor(string? flavor)
     {
         return flavor switch
         {
-            Flavor.STACK => stackHistory.ToArray(),
-            Flavor.INDEPENDENT => independentHistory.ToArray(),
+            Flavor.Stack => stackHistory.ToArray(),
+            Flavor.Independent => independentHistory.ToArray(),
             null => stackHistory.Concat(independentHistory).ToArray(),
             _ => throw new InvalidOperationException($"Cannot return calculations by flavor: {flavor}, did you forgot to add support for it?")
         };
