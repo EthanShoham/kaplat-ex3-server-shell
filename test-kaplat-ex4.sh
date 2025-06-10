@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-API_URL="http://localhost:8496"
+API_URL="http://localhost:4785"
 
 curl --verbose "$API_URL/calculator/stack/size"
 
