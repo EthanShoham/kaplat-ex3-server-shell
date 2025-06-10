@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Microsoft.AspNetCore.Http.Json;
@@ -8,10 +9,9 @@ using Serilog.Configuration;
 using Serilog.Context;
 using Serilog.Core;
 using Serilog.Events;
+using Serilog.Settings.Configuration;
 
 var builder = WebApplication.CreateBuilder(args);
-
-builder.Host.UseSerilog((context, configuration) => configuration.ReadFrom.Configuration(context.Configuration));
 
 builder.Services.Configure<JsonOptions>(options =>
 {
@@ -25,6 +25,31 @@ builder.Services.AddSingleton<ICalculator, Calculator>();
 builder.Services.AddSingleton<ICalculatorStack, CalculatorStack>();
 builder.Services.AddSingleton<ICalculationHistory, CalculationHistory>();
 builder.Services.AddSingleton<IRequestCounter, RequestCounter>();
+builder.Services.AddSingleton<IDictionary<string, LoggingLevelSwitch>>((_) => new Dictionary<string, LoggingLevelSwitch>());
+builder.Services.AddSingleton<IDictionary<string, LogEventLevel>>((_) => new Dictionary<string, LogEventLevel>
+{
+    { "DEBUG", LogEventLevel.Debug },
+    { "INFO", LogEventLevel.Information },
+    { "ERROR", LogEventLevel.Error }
+});
+builder.Services.AddSingleton<IDictionary<LogEventLevel, string>>((_) => new Dictionary<LogEventLevel, string>
+{
+    { LogEventLevel.Verbose, "TRACE" },
+    { LogEventLevel.Debug, "DEBUG" },
+    { LogEventLevel.Information, "INFO" },
+    { LogEventLevel.Warning, "WARN" },
+    { LogEventLevel.Error, "ERROR" },
+    { LogEventLevel.Fatal, "CRITICAL" }
+});
+builder.Services.AddSerilog((sp, configuration) =>
+{
+    var switchesDict = sp.GetRequiredService<IDictionary<string, LoggingLevelSwitch>>();
+    var readerOptions = new ConfigurationReaderOptions
+    {
+        OnLevelSwitchCreated = (name, switchLogger) => switchesDict[name.Substring(1).ToKababCase()] = switchLogger
+    };
+    configuration.ReadFrom.Configuration(builder.Configuration, readerOptions);
+});
 
 var app = builder.Build();
 
@@ -41,23 +66,29 @@ app.MapPost("/calculator/independent/calculate", (CalculationRequest? request, I
         request.Operation is null ||
         !Enum.TryParse<Operation>(request.Operation, true, out var operation))
     {
-        return Results.Conflict(CalculationResultBuilder.FromErrorMessage($"Error: unknown operation: {request?.Operation}"));
+        var err = CalculationResultBuilder.FromErrorMessage($"Error: unknown operation: {request?.Operation}");
+        logger.LogError("Server encountered an error ! message: {message}", err.ErrorMessage);
+        return Results.Conflict(err);
     }
 
     if (request.Arguments is null)
     {
-        return Results.Conflict(CalculationResultBuilder.FromErrorMessage($"Error: Not enough arguments to perform the operation {request.Operation}"));
+        var err = CalculationResultBuilder.FromErrorMessage($"Error: Not enough arguments to perform the operation {request.Operation}");
+        logger.LogError("Server encountered an error ! message: {message}", err.ErrorMessage);
+        return Results.Conflict(err);
     }
 
     if (!calculator.TryCalculate(operation, request.Arguments, out var result, out var error))
     {
         Debug.Assert(error is not null);
-        return Results.Conflict(CalculationResultBuilder.FromError(error.Value, request.Operation));
+        var err = CalculationResultBuilder.FromError(error.Value, request.Operation);
+        logger.LogError("Server encountered an error ! message: {message}", err.ErrorMessage);
+        return Results.Conflict(err);
     }
 
     Debug.Assert(result is not null);
-    logger.LogInformation("Performing operation {opration}. Result is {result}", operation, result);
-    logger.LogDebug("Performing operation: {operation}({arguments}) = {result}", operation, string.Join(',', request.Arguments), result);
+    logger.LogInformation("Performing operation {opration}. Result is {result}", request.Operation, result);
+    logger.LogDebug("Performing operation: {operation}({arguments}) = {result}", request.Operation, string.Join(',', request.Arguments), result);
     history.Add(Flavor.Independent, request.Operation, request.Arguments, result.Value);
     return Results.Ok(CalculationResultBuilder.FromResult(result.Value));
 });
@@ -66,7 +97,7 @@ app.MapGet("/calculator/stack/size", (ICalculatorStack stack, ILogger<Program> l
 {
     var stackSize = stack.StackCalculatorSize;
     logger.LogInformation("Stack size is {stackSize}", stackSize);
-    logger.LogDebug("Stack content (first == top): [{stackContent}]", string.Join(',', stack.Content));
+    logger.LogDebug("Stack content (first == top): [{stackContent}]", string.Join(", ", stack.Content));
     return Results.Ok(CalculationResultBuilder.FromResult(stackSize));
 });
 app.MapPut("/calculator/stack/arguments", (CalculationStackPutRequest? request, ICalculatorStack stack, ILogger<Program> logger) =>
@@ -79,7 +110,7 @@ app.MapPut("/calculator/stack/arguments", (CalculationStackPutRequest? request, 
     stack.PushArgumentsToStackCalculator(request.Arguments);
     var stackSizeAfter = stack.StackCalculatorSize;
     logger.LogInformation("Adding total of {argsLength} argument(s) to the stack | Stack size: {stackSizeAfter}", request.Arguments.Length, stackSizeAfter);
-    logger.LogDebug("Adding arguments: {stackContent} | Stack size before {stackSizeBefore} | stack size after {stackSizeAfter}", string.Join(',', stack.Content), stackSizeBefore, stackSizeAfter);
+    logger.LogDebug("Adding arguments: {arguments} | Stack size before {stackSizeBefore} | stack size after {stackSizeAfter}", string.Join(',', request.Arguments), stackSizeBefore, stackSizeAfter);
     return Results.Ok(CalculationResultBuilder.FromResult(stackSizeAfter));
 });
 app.MapDelete("/calculator/stack/arguments", ([Microsoft.AspNetCore.Mvc.FromQuery(Name = "count")] int count, ICalculatorStack stack, ILogger<Program> logger) =>
@@ -87,7 +118,9 @@ app.MapDelete("/calculator/stack/arguments", ([Microsoft.AspNetCore.Mvc.FromQuer
     var stackCount = stack.StackCalculatorSize;
     if (!stack.TryPopStackCalculatorArguments(count, out var arguments))
     {
-        return Results.Conflict(CalculationResultBuilder.FromErrorMessage($"Error: cannot remove {count} from the stack. It has only {stackCount} arguments"));
+        var err = CalculationResultBuilder.FromErrorMessage($"Error: cannot remove {count} from the stack. It has only {stackCount} arguments");
+        logger.LogError("Server encountered an error ! message: {message}", err.ErrorMessage);
+        return Results.Conflict(err);
     }
     Debug.Assert(arguments is not null);
     var stackSize = stack.StackCalculatorSize;
@@ -99,21 +132,27 @@ app.MapGet("/calculator/stack/operate", ([Microsoft.AspNetCore.Mvc.FromQuery(Nam
 {
     if (operationQuery is null || !Enum.TryParse<Operation>(operationQuery, true, out var operation))
     {
-        return Results.Conflict(CalculationResultBuilder.FromErrorMessage($"Error: unknown operation: {operationQuery}"));
+        var err = CalculationResultBuilder.FromErrorMessage($"Error: unknown operation: {operationQuery}");
+        logger.LogError("Server encountered an error ! message: {message}", err.ErrorMessage);
+        return Results.Conflict(err);
     }
 
     var stackCount = stack.StackCalculatorSize;
     var requiredAmount = calculator.GetRequriedArgumentsCount(operation);
     if (!stack.TryPopStackCalculatorArguments(requiredAmount, out var arguments))
     {
-        return Results.Conflict(CalculationResultBuilder.FromErrorMessage($"Error: cannot implement operation {operationQuery}. It requires {requiredAmount} arguments and the stack has only {stackCount} arguments"));
+        var err = CalculationResultBuilder.FromErrorMessage($"Error: cannot implement operation {operationQuery}. It requires {requiredAmount} arguments and the stack has only {stackCount} arguments");
+        logger.LogError("Server encountered an error ! message: {message}", err.ErrorMessage);
+        return Results.Conflict(err);
     }
 
     Debug.Assert(arguments is not null);
     if (!calculator.TryCalculate(operation, arguments, out var result, out var error))
     {
         Debug.Assert(error is not null);
-        return Results.Conflict(CalculationResultBuilder.FromError(error.Value, operationQuery));
+        var err = CalculationResultBuilder.FromError(error.Value, operationQuery);
+        logger.LogError("Server encountered an error ! message: {message}", err.ErrorMessage);
+        return Results.Conflict(err);
     }
 
     Debug.Assert(result is not null);
@@ -125,22 +164,66 @@ app.MapGet("/calculator/stack/operate", ([Microsoft.AspNetCore.Mvc.FromQuery(Nam
 
 app.MapGet("/calculator/history", ([Microsoft.AspNetCore.Mvc.FromQuery(Name = "flavor")] string? flavorString, ICalculationHistory history, ILogger<Program> logger) =>
 {
-    if (flavorString is null || Flavor.Independent.Equals(flavorString) || Flavor.Stack.Equals(flavorString))
+    if (flavorString is not null && !Flavor.Independent.Equals(flavorString) && !Flavor.Stack.Equals(flavorString))
     {
-        var calculations = history.CalculationsByFlavor(flavorString);
-        using (LogContext.PushProperty("Logger", "stack-logger"))
-        {
-            logger.LogInformation("History: So far total {stackCalcCount} stack actions", calculations.Where(a => Flavor.Stack.Equals(a.Flavor)).Count());
-        }
+        var err = CalculationResultBuilder.FromErrorMessage($"Error: unknown flavor: {flavorString}");
+        return Results.Conflict(err);
+    }
+
+    var calculations = history.CalculationsByFlavor(flavorString);
+    if (flavorString is null || Flavor.Independent.Equals(flavorString))
+    {
         using (LogContext.PushProperty("Logger", "independent-logger"))
         {
             logger.LogInformation("History: So far total {indiCalcCount} independent actions", calculations.Where(a => Flavor.Independent.Equals(a.Flavor)).Count());
         }
-        return Results.Ok(CalculationResultBuilder.FromResult(calculations));
+    }
+    if (flavorString is null || Flavor.Stack.Equals(flavorString))
+    {
+        using (LogContext.PushProperty("Logger", "stack-logger"))
+        {
+            logger.LogInformation("History: So far total {stackCalcCount} stack actions", calculations.Where(a => Flavor.Stack.Equals(a.Flavor)).Count());
+        }
     }
 
-    return Results.Conflict(CalculationResultBuilder.FromErrorMessage($"Error: unknown flavor: {flavorString}"));
+    return Results.Ok(CalculationResultBuilder.FromResult(calculations));
 });
+
+app.MapGet("/logs/level", ([Microsoft.AspNetCore.Mvc.FromQuery(Name = "logger-name")] string? loggerName, IDictionary<string, LoggingLevelSwitch> switchesDict, IDictionary<LogEventLevel, string> logLevelNameMap) =>
+{
+    if (string.IsNullOrWhiteSpace(loggerName))
+    {
+        return Results.BadRequest("logger-name is required.");
+    }
+
+    if (switchesDict.TryGetValue(loggerName, out var sw))
+    {
+        return Results.Ok(logLevelNameMap.TryGetValue(sw.MinimumLevel, out var name) ? name : sw.MinimumLevel.ToString().ToUpper());
+    }
+
+    return Results.Conflict($"{loggerName} doesn't exists.");
+});
+app.MapPut("/logs/level", ([Microsoft.AspNetCore.Mvc.FromQuery(Name = "logger-name")] string? loggerName, [Microsoft.AspNetCore.Mvc.FromQuery(Name = "logger-level")] string? loggerLevel, IDictionary<string, LoggingLevelSwitch> switchesDict, IDictionary<string, LogEventLevel> logLevelMap) =>
+{
+    if (string.IsNullOrWhiteSpace(loggerName) || string.IsNullOrWhiteSpace(loggerLevel))
+    {
+        return Results.BadRequest("logger-name and logger-level are required.");
+    }
+
+    if (!logLevelMap.TryGetValue(loggerLevel, out var level))
+    {
+        return Results.Conflict($"Invalid logger level: {loggerLevel}.");
+    }
+
+    if (switchesDict.TryGetValue(loggerName, out var sw))
+    {
+        sw.MinimumLevel = level;
+        return Results.Ok(loggerLevel);
+    }
+
+    return Results.Conflict($"{loggerName} doesn't exists.");
+});
+
 
 app.Run();
 
@@ -221,7 +304,7 @@ class CalculatorStack : ICalculatorStack
 
     public int StackCalculatorSize => argStack.Count;
 
-    public int[] Content => argStack.Reverse().ToArray();
+    public int[] Content => argStack.ToArray();
 
     public void PushArgumentsToStackCalculator(int[] arguments) => argStack.PushRange(arguments);
 
@@ -411,7 +494,7 @@ public class CustomLevelEnricher : ILogEventEnricher
             LogEventLevel.Debug => "DEBUG",
             LogEventLevel.Information => "INFO",
             LogEventLevel.Warning => "WARN",
-            LogEventLevel.Error => "ERR",
+            LogEventLevel.Error => "ERROR",
             LogEventLevel.Fatal => "CRITICAL",
             _ => logEvent.Level.ToString().ToUpper()
         };
@@ -424,5 +507,35 @@ public static class LoggerEnrichmentConfigurationExtensions
     public static LoggerConfiguration WithCustomLevel(this LoggerEnrichmentConfiguration enrich)
     {
         return enrich.With<CustomLevelEnricher>();
+    }
+}
+public static class StringExtensions
+{
+    public static string ToKababCase(this string text)
+    {
+        if (text == null)
+            throw new ArgumentNullException(nameof(text));
+
+        if (text.Length < 2)
+            return text.ToLowerInvariant();
+
+        var sb = new StringBuilder();
+        sb.Append(char.ToLowerInvariant(text[0]));
+
+        for (int i = 1; i < text.Length; i++)
+        {
+            char c = text[i];
+            if (char.IsUpper(c))
+            {
+                sb.Append('-');
+                sb.Append(char.ToLowerInvariant(c));
+            }
+            else
+            {
+                sb.Append(c);
+            }
+        }
+
+        return sb.ToString();
     }
 }
